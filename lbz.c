@@ -29,6 +29,7 @@
 typedef struct {
 	BZFILE *bz_stream;
 	FILE *f;
+	char mode;
 
 	/* getline related stuff */
 	char *buf;
@@ -38,10 +39,11 @@ typedef struct {
 /* Forward declarations */
 static lbz_state *lbz_check_state(lua_State *L, int index);
 
-static int lbz_read_open(lua_State *L);
+static int lbz_open(lua_State *L);
 static int lbz_read(lua_State *L);
-static void lbz_perform_close(lbz_state *state, int keep_extra_buf);
-static int lbz_read_close(lua_State *L);
+static int lbz_write(lua_State *L);
+static int lbz_perform_close(lua_State *L, lbz_state *state, int keep_extra_buf);
+static int lbz_close(lua_State *L);
 static int lbz_getline(lua_State *L);
 static int lbz_getline_read(lua_State *L, luaL_Buffer *b, lbz_state *state, int keep_eol);
 
@@ -55,14 +57,15 @@ static void lbz_buffer_drain(lbz_state *state, size_t amount);
 static void lbz_buffer_drain_all(lbz_state *state);
 
 static const struct luaL_reg bzlib_f [] = {
-	{"open", lbz_read_open},
+	{"open", lbz_open},
 	{NULL, NULL} /* Sentinel */
 };
 
 static const struct luaL_reg bzlib_m [] = {
 	{"read", lbz_read},
+	{"write", lbz_write},
 	{"getline", lbz_getline},
-	{"close", lbz_read_close},
+	{"close", lbz_close},
 	{"lines", lbz_lines},
 	{NULL, NULL} /* Sentinel */
 };
@@ -71,27 +74,53 @@ lbz_state *lbz_check_state(lua_State *L, int index) {
 	return (lbz_state *)luaL_checkudata(L, index, LBZ_STATE_META);
 }
 
-/* Binding to libbzip2's BZ2_bzReadOpen method */
-int lbz_read_open(lua_State *L) {
+/* Binding to libbzip2's BZ2_bzReadOpen and BZ2_bzWriteOpen method */
+int lbz_open(lua_State *L) {
 	size_t len;
 	const char *fname = lua_tolstring(L, 1, &len);
-	FILE *f = fopen(fname, "rb");
+	size_t modelen;
+	const char *mode = luaL_optlstring(L, 2, "r", &modelen);
+	FILE *f = NULL;
+
+	if (mode[0] == 'r') {
+		f = fopen(fname, "rb");
+	} else if (mode[0] == 'w') {
+		f = fopen(fname, "wb");
+	} else {
+		return luaL_error(L, "Illegal mode: %s", lua_tostring(L, 1));
+	}
 
 	if (f == NULL)
 		return luaL_error(L, "Failed to fopen %s", fname);
 
 	int bzerror;
 	lbz_state *state = (lbz_state *) lua_newuserdata(L, sizeof(lbz_state));
-	state->bz_stream = BZ2_bzReadOpen(&bzerror, f, 0, 0, NULL, 0);
-	state->f = f;
 
-	lbz_buffer_init(state);
+	state->f = f;
+	state->mode = mode[0];
+
+	if (mode[0] == 'r') {
+		state->bz_stream = BZ2_bzReadOpen(&bzerror, f, 0, 0, NULL, 0);
+		lbz_buffer_init(state);
+	} else {
+		int level = 9;
+		if (modelen == 2) {
+			level = mode[1] - '0';
+			if (level < 1 || level > 9) {
+				return luaL_error(L, "Illegal compression rate: %c", mode[1]);
+			}
+		}
+		state->bz_stream = BZ2_bzWriteOpen(&bzerror, f, level, 0, 0);
+	}
 
 	luaL_getmetatable(L, LBZ_STATE_META);
 	lua_setmetatable(L, -2);
 
-	if (bzerror != BZ_OK)
+	if (bzerror != BZ_OK) {
 		lua_pushnil(L);
+		lua_pushstring(L, BZ2_bzerror(state->bz_stream, &bzerror));
+		return 2;
+	}
 
 	return 1;
 }
@@ -131,9 +160,15 @@ static int lbz_read(lua_State *L) {
 	lbz_state *state = lbz_check_state(L, 1);
 	len = luaL_checkint(L, 2);
 
+	if (state->mode != 'r') {
+		lua_pushnil(L);
+		lua_pushstring(L, "NOT IN READ MODE");
+		return 2;
+	}
+
 	if (!state->bz_stream && !state->buf) {
 		/* The logical end of file has been reached -- there's no more data to
-		 * return, and the user should call the read_close method. */
+		 * return, and the user should call the close method. */
 		lua_pushnil(L);
 		lua_pushstring(L, "CLOSED");
 		return 2;
@@ -167,7 +202,7 @@ handle_error:
 	if(BZ_STREAM_END == bzerror) {
 		/* Push the data read already and mark the stream done */
 		luaL_pushresult(&b);
-		lbz_perform_close(state, 0);
+		lbz_perform_close(L, state, 0);
 		return 1;
 	} else {
 		lua_pushnil(L);
@@ -176,23 +211,61 @@ handle_error:
 	}
 }
 
-void lbz_perform_close(lbz_state *state, int keep_extra_buf) {
+static int lbz_write(lua_State *L) {
+	int bzerror = BZ_OK;
+	lbz_state *state = lbz_check_state(L, 1);
+	int i;
+
+	if (state->mode != 'w') {
+		lua_pushnil(L);
+		lua_pushstring(L, "NOT IN WRITE MODE");
+		return 2;
+	}
+
+	for (i=2; i<=lua_gettop(L); i++) {
+		size_t len;
+		const char *str = luaL_checklstring(L, i, &len);
+		BZ2_bzWrite(&bzerror, state->bz_stream, (void*)str, len);
+		if (bzerror != BZ_OK) {
+			lua_pushnil(L);
+			lua_pushstring(L, BZ2_bzerror(state->bz_stream, &bzerror));
+			return 2;
+		}
+	}
+
+	lua_pushboolean(L, 1);
+	return 1;
+}
+
+int lbz_perform_close(lua_State *L, lbz_state *state, int keep_extra_buf) {
 	int bzerror;
-	if(!keep_extra_buf)
-		lbz_buffer_free(state);
+	int ret = 0;
+	if (state->mode == 'r' && !keep_extra_buf) {
+			lbz_buffer_free(state);
+	}
+
 	if(!state->bz_stream)
-		return;
-	BZ2_bzReadClose(&bzerror, state->bz_stream);
+		return 0;
+
+	if (state->mode == 'r') {
+		BZ2_bzReadClose(&bzerror, state->bz_stream);
+	} else {
+		unsigned int in, out;
+		BZ2_bzWriteClose(&bzerror, state->bz_stream, 0, &in, &out);
+		lua_pushnumber(L, in);
+		lua_pushnumber(L, out);
+		return 2;
+	}
 	fclose(state->f);
 	state->bz_stream = NULL;
 	state->f = NULL;
+	return ret;
 }
 
 /* Binding to libbzip2's BZ2_bzReadClose method */
-static int lbz_read_close(lua_State *L) {
+static int lbz_close(lua_State *L) {
 	lbz_state *state = lbz_check_state(L, 1);
-	lbz_perform_close(state, 0);
-	return 0;
+	return lbz_perform_close(L, state, 0);
 }
 
 /*
@@ -238,7 +311,7 @@ static int lbz_getline_read(lua_State *L, luaL_Buffer *b, lbz_state *state, int 
 	lbz_buffer_drain_all(state);
 
 	if (!state->bz_stream) { /* No more data left at all - return data is 'success' */
-		lbz_perform_close(state, 0); // Completely close it out now
+		lbz_perform_close(L, state, 0); // Completely close it out now
 		luaL_pushresult(b);
 		return 1;
 	}
@@ -257,7 +330,7 @@ static int lbz_getline_read(lua_State *L, luaL_Buffer *b, lbz_state *state, int 
 
 		/* Kill the stream, keep the remaining buffer */
 		if (bzerror == BZ_STREAM_END)
-			lbz_perform_close(state, state->buf_size ? 1 : 0);
+			lbz_perform_close(L, state, state->buf_size ? 1 : 0);
 		return 1;
 	}
 	return 0;
@@ -306,7 +379,7 @@ int lbz_lines(lua_State *L) {
 }
 
 static int lbz_gc(lua_State *L) {
-	lbz_read_close(L);
+	lbz_close(L);
 	return 0;
 }
 
