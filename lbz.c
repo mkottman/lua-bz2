@@ -47,6 +47,9 @@ static int lbz_close(lua_State *L);
 static int lbz_getline(lua_State *L);
 static int lbz_getline_read(lua_State *L, luaL_Buffer *b, lbz_state *state, int keep_eol);
 
+static int lbz_compress(lua_State *L);
+static int lbz_decompress(lua_State *L);
+
 static int lbz_lines(lua_State *L);
 
 static void lbz_buffer_init(lbz_state *state);
@@ -58,6 +61,8 @@ static void lbz_buffer_drain_all(lbz_state *state);
 
 static const struct luaL_reg bzlib_f [] = {
 	{"open", lbz_open},
+	{"compress", lbz_compress},
+	{"decompress", lbz_decompress},
 	{NULL, NULL} /* Sentinel */
 };
 
@@ -382,6 +387,105 @@ static int lbz_gc(lua_State *L) {
 	lbz_close(L);
 	return 0;
 }
+
+/* low-level compression
+	bz2.compress(s, [level]) -> string -- level defaults to 9
+*/
+static int lbz_compress(lua_State *L) {
+	size_t len;
+	const char *input = luaL_checklstring(L, 1, &len);
+	int level = luaL_optinteger(L, 2, 9);
+	int err;
+	bz_stream stream = {0};
+
+	err = BZ2_bzCompressInit(&stream, level, 0, 0);
+	if (err != BZ_OK)
+		goto handle_error;
+
+	luaL_Buffer b;
+    luaL_buffinit(L, &b);
+
+	stream.next_in = (char*) input;
+	stream.avail_in = len;
+
+	/* feed input data */
+	while (stream.total_in_lo32 < len) {
+		stream.next_out = (char*) luaL_prepbuffer(&b);
+		stream.avail_out = LUAL_BUFFERSIZE;
+
+		err = BZ2_bzCompress(&stream, BZ_RUN);
+		if (err < 0)
+			goto handle_error;
+
+		luaL_addsize(&b, LUAL_BUFFERSIZE - stream.avail_out);
+	}
+
+	/* save any lefover data */
+	while (1) {
+		stream.next_out = (char*) luaL_prepbuffer(&b);
+		stream.avail_out = LUAL_BUFFERSIZE;
+
+		err = BZ2_bzCompress(&stream, BZ_FINISH);
+		if (err < 0)
+			goto handle_error;
+
+		luaL_addsize(&b, LUAL_BUFFERSIZE - stream.avail_out);
+		if (err == BZ_STREAM_END)
+			break;
+	}
+
+	BZ2_bzCompressEnd(&stream);
+
+	luaL_pushresult(&b);
+	return 1;
+
+handle_error:
+	lua_pushnil(L);
+	lua_pushstring(L, BZ2_bzerror(&stream, &err));
+	return 2;
+}
+
+/* low-level decompression
+	bz2.decompress(s) -> string
+*/
+static int lbz_decompress(lua_State *L) {
+	size_t len;
+	const char *input = luaL_checklstring(L, 1, &len);
+	int err;
+	bz_stream stream = {0};
+
+	err = BZ2_bzDecompressInit(&stream, 0, 0);
+	if (err != BZ_OK)
+		goto handle_error;
+
+	luaL_Buffer b;
+    luaL_buffinit(L, &b);
+
+	stream.next_in = (char*) input;
+	stream.avail_in = len;
+
+	/* feed input data */
+	while (stream.total_in_lo32 < len) {
+		stream.next_out = (char*) luaL_prepbuffer(&b);
+		stream.avail_out = LUAL_BUFFERSIZE;
+
+		err = BZ2_bzDecompress(&stream);
+		if (err < 0)
+			goto handle_error;
+
+		luaL_addsize(&b, LUAL_BUFFERSIZE - stream.avail_out);
+	}
+
+	BZ2_bzDecompressEnd(&stream);
+	luaL_pushresult(&b);
+	return 1;
+
+handle_error:
+	lua_pushnil(L);
+	lua_pushstring(L, BZ2_bzerror(&stream, &err));
+	return 2;
+}
+
 
 int luaopen_bz2(lua_State *L) {
 	luaL_newmetatable(L, LBZ_STATE_META);
