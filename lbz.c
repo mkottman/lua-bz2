@@ -154,10 +154,19 @@ void lbz_buffer_drain_all(lbz_state *state) {
 /* Binding to libbzip2's BZ2_bzReadOpen method */
 static int lbz_read(lua_State *L) {
 	int bzerror = BZ_OK;
-	int len;
+	int len = 0;
 	luaL_Buffer b;
 	lbz_state *state = lbz_check_state(L, 1);
-	len = luaL_checkint(L, 2);
+
+	if (lua_type(L, 2) == LUA_TSTRING) {
+		if (strcmp(lua_tostring(L, 2), "*a") == 0) {
+			len = INT_MAX;
+		} else {
+			luaL_argerror(L, 2, "expecting number or '*a'");
+		}
+	} else {
+		len = luaL_checkint(L, 2);
+	}
 
 	if (state->mode != 'r') {
 		lua_pushnil(L);
