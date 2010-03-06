@@ -86,6 +86,7 @@ int lbz_open(lua_State *L) {
 	size_t modelen;
 	const char *mode = luaL_optlstring(L, 2, "r", &modelen);
 	FILE *f = NULL;
+	int level = luaL_optint(L, 3, 9);
 
 	if (mode[0] == 'r') {
 		f = fopen(fname, "rb");
@@ -108,13 +109,6 @@ int lbz_open(lua_State *L) {
 		state->bz_stream = BZ2_bzReadOpen(&bzerror, f, 0, 0, NULL, 0);
 		lbz_buffer_init(state);
 	} else {
-		int level = 9;
-		if (modelen == 2) {
-			level = mode[1] - '0';
-			if (level < 1 || level > 9) {
-				return luaL_error(L, "Illegal compression rate: %c", mode[1]);
-			}
-		}
 		state->bz_stream = BZ2_bzWriteOpen(&bzerror, f, level, 0, 0);
 	}
 
