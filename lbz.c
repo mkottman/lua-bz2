@@ -246,7 +246,7 @@ int lbz_perform_close(lua_State *L, lbz_state *state, int keep_extra_buf) {
 	int bzerror;
 	int ret = 0;
 	if (state->mode == 'r' && !keep_extra_buf) {
-			lbz_buffer_free(state);
+		lbz_buffer_free(state);
 	}
 
 	if(!state->bz_stream)
@@ -259,7 +259,7 @@ int lbz_perform_close(lua_State *L, lbz_state *state, int keep_extra_buf) {
 		BZ2_bzWriteClose(&bzerror, state->bz_stream, 0, &in, &out);
 		lua_pushnumber(L, in);
 		lua_pushnumber(L, out);
-		return 2;
+		ret = 2;
 	}
 	fclose(state->f);
 	state->bz_stream = NULL;
