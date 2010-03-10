@@ -96,8 +96,13 @@ int lbz_open(lua_State *L) {
 		return luaL_error(L, "Illegal mode: %s", lua_tostring(L, 1));
 	}
 
-	if (f == NULL)
-		return luaL_error(L, "Failed to fopen %s", fname);
+	if (f == NULL) {
+		lua_pushnil(L);
+		lua_pushstring(L, "Failed to open: ");
+		lua_pushvalue(L, 1);
+		lua_concat(L, 2);
+		return 2;
+	}
 
 	int bzerror;
 	lbz_state *state = (lbz_state *) lua_newuserdata(L, sizeof(lbz_state));
